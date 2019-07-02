@@ -106,6 +106,7 @@ struct ltn_histogram_s
 	struct timeval sampleLast;
 
 	/* Helper mechism for printing the histogram routinely. */
+	char printPrefix[64];
 	struct timeval printLast;
 	struct timeval printSummaryLast;
 };
@@ -254,6 +255,30 @@ static __inline__ int ltn_histogram_interval_update(struct ltn_histogram_s *ctx)
 	return diffMs;
 }
 
+static __inline__ int ltn_histogram_interval_update_us(struct ltn_histogram_s *ctx)
+{
+	struct timeval now;
+	gettimeofday(&now, NULL);
+
+	struct timeval r;
+	ltn_histogram_timeval_subtract(&r, &now, &ctx->intervalLast);
+	uint32_t diffMs = ltn_histogram_timeval_to_ms(&r);
+	uint32_t diffUs = ltn_histogram_timeval_to_us(&r);
+
+	ctx->intervalLast = now; /* Implicit struct copy. */
+
+	if ((diffMs < ctx->minValMs) || (diffMs > ctx->maxValMs)) {
+		ctx->bucketMissCount++;
+		return -1;
+	}
+
+	struct ltn_histogram_bucket_s *bucket = ltn_histogram_bucket(ctx, diffMs);
+	bucket->lastUpdate = now; /* Implicit struct copy. */
+	bucket->count++;
+
+	return diffUs;
+}
+
 static __inline__ void ltn_histogram_interval_print(int fd, struct ltn_histogram_s *ctx, unsigned int seconds)
 {
 	if (seconds) {
@@ -270,7 +295,7 @@ static __inline__ void ltn_histogram_interval_print(int fd, struct ltn_histogram
 		ctx->printLast = now; /* Implicit struct copy. */
 	}
 
-	dprintf(fd, "Histogram '%s' (ms, count, last update time)\n", ctx->name);
+	dprintf(fd, "%sHistogram '%s' (ms, count, last update time)\n", ctx->printPrefix, ctx->name);
 
 	uint64_t cnt = 0, measurements = 0;
 	for (uint32_t i = 0; i < ctx->bucketCount; i++) {
@@ -284,11 +309,12 @@ static __inline__ void ltn_histogram_interval_print(int fd, struct ltn_histogram
 
 		dprintf(fd,
 #if defined(__APPLE__)
-			"-> %5" PRIu64 " %8" PRIu64 "  %s (%ld.%d)\n",
+			"%s-> %5" PRIu64 " %8" PRIu64 "  %s (%ld.%d)\n",
 #endif
 #if defined(__linux__)
-			"-> %5" PRIu64 " %8" PRIu64 "  %s (%u.%u)\n",
+			"%s-> %5" PRIu64 " %8" PRIu64 "  %s (%u.%u)\n",
 #endif
+			ctx->printPrefix,
 			ctx->minValMs + i,
 			b->count,
 			timestamp,
@@ -300,10 +326,11 @@ static __inline__ void ltn_histogram_interval_print(int fd, struct ltn_histogram
 	}
 
 	if (ctx->bucketMissCount) {
-		dprintf(fd, "%" PRIu64 " out-of-range bucket misses\n", ctx->bucketMissCount);
+		dprintf(fd, "%s%" PRIu64 " out-of-range bucket misses\n", ctx->printPrefix, ctx->bucketMissCount);
 	}
 
-	dprintf(fd, "%" PRIu64 " distinct buckets with %" PRIu64 " total measurements, range: %" PRIu64 " -> %" PRIu64 " ms\n",
+	dprintf(fd, "%s%" PRIu64 " distinct buckets with %" PRIu64 " total measurements, range: %" PRIu64 " -> %" PRIu64 " ms\n",
+		ctx->printPrefix,
 		cnt,
 		measurements,
 		ctx->minValMs, ctx->maxValMs);
@@ -416,5 +443,71 @@ __inline__ static uint64_t ltn_histogram_sample_end(struct ltn_histogram_s *ctx)
 	return ctx->sampleMs;
 }
 
-#endif /* LTN_HISTOGRAM_H */
+__inline__ void ltn_histogram_set_print_prefix(struct ltn_histogram_s *ctx, const char *prefix)
+{
+	strcpy(ctx->printPrefix, prefix);
+}
 
+struct ltn_1sec_counter_int64_s
+{
+	int64_t  counter;
+	int64_t  value;
+	double   value_average;
+	double   value_average_lwm, value_average_hwm;
+	uint64_t writes;
+	time_t  ts;
+};
+__inline__ int64_t ltn_1sec_counter_int64_read_value(struct ltn_1sec_counter_int64_s *s)
+{
+	return s->value;
+}
+__inline__ double ltn_1sec_counter_int64_read_average(struct ltn_1sec_counter_int64_s *s)
+{
+	return s->value_average;
+}
+__inline__ double ltn_1sec_counter_int64_read_average_lwm(struct ltn_1sec_counter_int64_s *s)
+{
+	if (s->value_average_lwm > s->value_average_hwm)
+		return 0;
+	return s->value_average_lwm;
+}
+__inline__ double ltn_1sec_counter_int64_read_average_hwm(struct ltn_1sec_counter_int64_s *s)
+{
+	if (s->value_average_lwm > s->value_average_hwm)
+		return 0;
+	return s->value_average_hwm;
+}
+
+__inline__ void ltn_1sec_counter_int64_reset(struct ltn_1sec_counter_int64_s *s)
+{
+	memset(s, 0, sizeof(*s));
+	s->value_average_lwm = 1000000;
+	time(&s->ts);
+}
+
+/* Return true if the counter changed. */
+__inline__ int ltn_1sec_counter_int64_update(struct ltn_1sec_counter_int64_s *s, int64_t value)
+{
+	int ret = 0;
+
+	time_t now;
+	time(&now);
+	if (s->ts != now) {
+		s->ts = now;
+		s->value = s->counter;
+		s->value_average = (double)s->counter / (double)s->writes;
+		if (s->value_average <= s->value_average_lwm)
+			s->value_average_lwm = s->value_average;
+		if (s->value_average > s->value_average_hwm)
+			s->value_average_hwm = s->value_average;
+		s->counter = 0;
+		s->writes = 0;
+		ret = 1;
+	}
+	s->writes++;
+	s->counter += value;
+
+	return ret;
+}
+
+#endif /* LTN_HISTOGRAM_H */

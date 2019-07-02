@@ -10,6 +10,7 @@
 #include "pids.h"
 #include "xorg-list.h"
 #include "parsers.h"
+#include "histogram.h"
 
 #include <pcap.h>
 #include <arpa/inet.h>
@@ -20,6 +21,7 @@
 #define DEFAULT_TRAILERROW 18
 #define FILE_WRITE_INTERVAL 5
 #define DEFAULT_PCAP_FILTER "udp dst portrange 4000-4999"
+#define HISTOGRAM_OUTPUT 0
 
 static int gRunning = 0;
 
@@ -53,6 +55,10 @@ struct tool_context_s
 	char *file_prefix;
 	int file_write_interval;
 	time_t file_next_write_time;
+
+	/* Network Statistics */
+	struct ltn_histogram_s *ifg_stats;
+	struct ltn_1sec_counter_int64_s ifg_stats_avg_us; // MMM
 };
 static struct tool_context_s g_ctx = { 0 };
 static struct tool_context_s *ctx = &g_ctx;
@@ -66,6 +72,10 @@ struct discovered_item_s
 	struct ether_header ethhdr;
 	struct iphdr iphdr;
 	struct udphdr udphdr;
+
+	/* Network Statistics */
+	struct ltn_histogram_s *ipg_stats;
+	struct ltn_1sec_counter_int64_s ipg_stats_avg_us; // MMM
 
 	/* PID Statistics */
 	struct stream_statistics_s stats;
@@ -101,6 +111,12 @@ struct discovered_item_s *discovered_item_alloc(struct ether_header *ethhdr, str
 
 		sprintf(di->srcaddr, "%s:%d", inet_ntoa(srcaddr), ntohs(di->udphdr.uh_sport));
 		sprintf(di->dstaddr, "%s:%d", inet_ntoa(dstaddr), ntohs(di->udphdr.uh_dport));
+
+		char label[256];
+		sprintf(label, "TS Inter Packet Gap (%s -> %s)", di->srcaddr, di->dstaddr); 
+		ltn_histogram_alloc(&di->ipg_stats, label, 0, 5000);
+		ltn_histogram_set_print_prefix(di->ipg_stats, "    ");
+		ltn_1sec_counter_int64_reset(&di->ipg_stats_avg_us);
 	}
 
 	return di;
@@ -155,6 +171,9 @@ static void discovered_item_console_summary(struct tool_context_s *ctx, struct d
 				pid_stats_pid_get_mbps(&di->stats, i));
 		}
 	}
+#if HISTOGRAM_OUTPUT
+	ltn_histogram_interval_print(STDOUT_FILENO, di->ipg_stats, 0);
+#endif
 }
 
 static void discovered_items_console_summary(struct tool_context_s *ctx)
@@ -258,6 +277,8 @@ static void discovered_items_stats_reset(struct tool_context_s *ctx)
 	pthread_mutex_lock(&ctx->lock);
 	xorg_list_for_each_entry(e, &ctx->list, list) {
 		pid_stats_reset(&e->stats);
+		ltn_histogram_reset(e->ipg_stats);
+		ltn_1sec_counter_int64_reset(&e->ipg_stats_avg_us);
 	}
 	pthread_mutex_unlock(&ctx->lock);
 }
@@ -269,12 +290,18 @@ static void _processPackets(struct tool_context_s *ctx,
 	struct discovered_item_s *di = discovered_item_findcreate(ctx, ethhdr, iphdr, udphdr);
 	di->isRTP = isRTP;
 
+	int us = ltn_histogram_interval_update_us(di->ipg_stats);
+	ltn_1sec_counter_int64_update(&di->ipg_stats_avg_us, us);
+
 	pid_stats_update(&di->stats, pkts, pktCount);
 }
 
 static void pcap_callback(u_char *args, const struct pcap_pkthdr *h, const u_char *pkt) 
 { 
 	int isRTP = 0;
+
+	int us = ltn_histogram_interval_update_us(ctx->ifg_stats);
+	ltn_1sec_counter_int64_update(&ctx->ifg_stats_avg_us, us);
 
 	if (h->len < sizeof(struct ether_header) + sizeof(struct iphdr) + sizeof(struct udphdr))
 		return;
@@ -352,17 +379,21 @@ static void *ui_thread_func(void *p)
 		//printf("   mask: %s\n", inet_ntoa(ip_mask));
 
 		char title_a[160], title_b[160], title_c[160];
-		sprintf(title_a, ctx->pcap_filter);
+		sprintf(title_a, "%s -- IFG: %.0f (%.0f-%.0f)", ctx->pcap_filter,
+				ltn_1sec_counter_int64_read_average(&ctx->ifg_stats_avg_us),
+				ltn_1sec_counter_int64_read_average_lwm(&ctx->ifg_stats_avg_us),
+				ltn_1sec_counter_int64_read_average_hwm(&ctx->ifg_stats_avg_us));
 		char mask[64];
 		sprintf(mask, "%s", inet_ntoa(ip_mask));
 		sprintf(title_c, "NIC: %s (%s/%s)", ctx->ifname, inet_ntoa(ip_net), mask);
-		int blen = 86 - (strlen(title_a) + strlen(title_c));
+
+		int blen = 97 - (strlen(title_a) + strlen(title_c));
 		memset(title_b, 0x20, sizeof(title_b));
 		title_b[blen] = 0;
 
 		attron(COLOR_PAIR(1));
 		mvprintw( 0, 0, "%s%s%s", title_a, title_b, title_c);
-		mvprintw( 1, 0, "<--------------------------------------------------- M/BIT <------PACKETS <------CCErr");
+		mvprintw( 1, 0, "<--------------------------------------------------- M/BIT <------PACKETS <------CCErr <--IPG(Us)");
 		attroff(COLOR_PAIR(1));
 
 		int streamCount = 1;
@@ -373,13 +404,14 @@ static void *ui_thread_func(void *p)
 			if (di->stats.ccErrors)
 				attron(COLOR_PAIR(3));
 
-			mvprintw(streamCount + 2, 0, "%s %21s -> %21s  %6.2f  %13" PRIu64 " %12" PRIu64 "",
+			mvprintw(streamCount + 2, 0, "%s %21s -> %21s  %6.2f  %13" PRIu64 " %12" PRIu64 "  %9.0f",
 				di->isRTP ? "RTP" : "UDP",
 				di->srcaddr,
 				di->dstaddr,
 				pid_stats_stream_get_mbps(&di->stats),
 				di->stats.packetCount,
-				di->stats.ccErrors);
+				di->stats.ccErrors, // MMM
+				ltn_1sec_counter_int64_read_average(&di->ipg_stats_avg_us));
 
 			if (di->stats.ccErrors)
 				attroff(COLOR_PAIR(3));
@@ -398,7 +430,7 @@ static void *ui_thread_func(void *p)
 		memset(tail_b, '-', sizeof(tail_b));
 		sprintf(tail_a, "TSTOOLS_NIC_MONITOR");
 		sprintf(tail_c, "%s", ctime(&now));
-		blen = 87 - (strlen(tail_a) + strlen(tail_c));
+		blen = 98 - (strlen(tail_a) + strlen(tail_c));
 		memset(tail_b, 0x20, sizeof(tail_b));
 		tail_b[blen] = 0;
 
@@ -549,6 +581,11 @@ int nic_monitor(int argc, char *argv[])
 
 	printf("  iface: %s\n", ctx->ifname);
 
+	char label[256];
+	sprintf(label, "PCAP Inter Frame Gap (%s)", ctx->ifname);
+	ltn_histogram_alloc(&ctx->ifg_stats, label, 0, 5000);
+	ltn_1sec_counter_int64_reset(&ctx->ifg_stats_avg_us);
+
 	pcap_lookupnet(ctx->ifname, &ctx->netp, &ctx->maskp, ctx->errbuf);
 
 	struct in_addr ip_net, ip_mask;
@@ -599,6 +636,8 @@ int nic_monitor(int argc, char *argv[])
 			break;
 		if (c == 'r') {
 			discovered_items_stats_reset(ctx);
+			ltn_histogram_reset(ctx->ifg_stats);
+			ltn_1sec_counter_int64_reset(&ctx->ifg_stats_avg_us);
 		}
 		usleep(50 * 1000);
 	}
@@ -617,6 +656,16 @@ int nic_monitor(int argc, char *argv[])
 		}
 		endwin();
 	}
+
+	printf("\nInter-frame gap range %.0f to %.0f (Us)\n",
+		ltn_1sec_counter_int64_read_average_lwm(&ctx->ifg_stats_avg_us),
+		ltn_1sec_counter_int64_read_average_hwm(&ctx->ifg_stats_avg_us));
+
+	printf("\n");
+#if HISTOGRAM_OUTPUT
+	ltn_histogram_interval_print(STDOUT_FILENO, ctx->ifg_stats, 0);
+	printf("\n");
+#endif
 
 	discovered_items_console_summary(ctx);
 
