@@ -7,7 +7,7 @@
 #include <curses.h>
 #include <inttypes.h>
 #include <pthread.h>
-#include "pids.h"
+#include <libltntstools/ltntstools.h>
 #include "xorg-list.h"
 #include "parsers.h"
 
@@ -74,7 +74,7 @@ struct discovered_item_s
 	struct udphdr udphdr;
 
 	/* PID Statistics */
-	struct stream_statistics_s stats;
+	struct ltntstools_stream_statistics_s stats;
 
 	/* File output */
 	char filename[128];
@@ -163,7 +163,7 @@ static void discovered_item_console_summary(struct tool_context_s *ctx, struct d
 	sprintf(stream + strlen(stream), " -> %s", di->dstaddr);
 
 	printf("   PID   PID     PacketCount     CCErrors    TEIErrors @ %6.2f : %s (%s)\n",
-		pid_stats_stream_get_mbps(&di->stats), stream,
+		ltntstools_pid_stats_stream_get_mbps(&di->stats), stream,
 		di->isRTP ? "RTP" : "UDP");
 	printf("<---------------------------  ----------- ------------ ---Mb/ps------------------------------------------------>\n");
 	for (int i = 0; i < MAX_PID; i++) {
@@ -172,7 +172,7 @@ static void discovered_item_console_summary(struct tool_context_s *ctx, struct d
 				di->stats.pids[i].packetCount,
 				di->stats.pids[i].ccErrors,
 				di->stats.pids[i].teiErrors,
-				pid_stats_pid_get_mbps(&di->stats, i));
+				ltntstools_pid_stats_pid_get_mbps(&di->stats, i));
 		}
 	}
 }
@@ -234,8 +234,8 @@ static void discovered_item_file_summary(struct tool_context_s *ctx, struct disc
 	sprintf(line, "time=%s,nic=%s,bps=%d,mbps=%.2f,tspacketcount=%" PRIu64 ",ccerrors=%" PRIu64 ",src=%s,dst=%s\n",
 		ts,
 		ctx->ifname,
-		pid_stats_stream_get_bps(&di->stats),
-		pid_stats_stream_get_mbps(&di->stats),
+		ltntstools_pid_stats_stream_get_bps(&di->stats),
+		ltntstools_pid_stats_stream_get_mbps(&di->stats),
 		di->stats.packetCount,
 		di->stats.ccErrors,
 		di->srcaddr,
@@ -277,7 +277,7 @@ static void discovered_items_stats_reset(struct tool_context_s *ctx)
 
 	pthread_mutex_lock(&ctx->lock);
 	xorg_list_for_each_entry(e, &ctx->list, list) {
-		pid_stats_reset(&e->stats);
+		ltntstools_pid_stats_reset(&e->stats);
 	}
 	pthread_mutex_unlock(&ctx->lock);
 }
@@ -289,7 +289,7 @@ static void _processPackets(struct tool_context_s *ctx,
 	struct discovered_item_s *di = discovered_item_findcreate(ctx, ethhdr, iphdr, udphdr);
 	di->isRTP = isRTP;
 
-	pid_stats_update(&di->stats, pkts, pktCount);
+	ltntstools_pid_stats_update(&di->stats, pkts, pktCount);
 }
 
 static void pcap_callback(u_char *args, const struct pcap_pkthdr *h, const u_char *pkt) 
@@ -306,15 +306,9 @@ static void pcap_callback(u_char *args, const struct pcap_pkthdr *h, const u_cha
 #ifdef __APPLE__
 		if (ip->ip_p != IPPROTO_UDP)
 			return;
-
-		if (!IN_MULTICAST(ntohl(ip->ip_dst.s_addr)))
-			return;
 #endif
 #ifdef __linux__
 		if (ip->protocol != IPPROTO_UDP)
-			return;
-
-		if (!IN_MULTICAST(ntohl(ip->daddr)))
 			return;
 #endif
 
@@ -412,7 +406,7 @@ static void *ui_thread_func(void *p)
 				di->isRTP ? "RTP" : "UDP",
 				di->srcaddr,
 				di->dstaddr,
-				pid_stats_stream_get_mbps(&di->stats),
+				ltntstools_pid_stats_stream_get_mbps(&di->stats),
 				di->stats.packetCount,
 				di->stats.ccErrors);
 

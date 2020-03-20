@@ -9,7 +9,7 @@
 #include <curses.h>
 #include <inttypes.h>
 #include <pthread.h>
-#include "pids.h"
+#include <libltntstools/ltntstools.h>
 #include "ffmpeg-includes.h"
 
 #define DEFAULT_FIFOSIZE 1048576
@@ -31,7 +31,7 @@ struct tool_context_s
 	uint64_t bytesWrittenCurrent;
 	time_t bytesWrittenTime;
 
-	struct stream_statistics_s stream;
+	struct ltntstools_stream_statistics_s stream;
 
 	int monitor;
 	pthread_t threadId;
@@ -110,16 +110,16 @@ static void *packet_cb(struct tool_context_s *ctx, unsigned char *buf, int byteC
 	}
 
 	for (int i = 0; i < byteCount; i += 188) {
-		uint16_t pidnr = getPID(buf + i);
-		struct pid_statistics_s *pid = &ctx->stream.pids[pidnr];
+		uint16_t pidnr = ltntstools_pid(buf + i);
+		struct ltntstools_pid_statistics_s *pid = &ctx->stream.pids[pidnr];
 
 		ctx->bytesWrittenCurrent += 188;
 
 		pid->enabled = 1;
 		pid->packetCount++;
 
-		uint8_t cc = getCC(buf + i);
-		if (isCCInError(buf + i, pid->lastCC)) {
+		uint8_t cc = ltntstools_continuity_counter(buf + i);
+		if (ltntstools_isCCInError(buf + i, pid->lastCC)) {
 			if (pid->packetCount > 1 && pidnr != 0x1fff) {
 				char ts[256];
 				time_t now = time(0);
@@ -132,7 +132,7 @@ static void *packet_cb(struct tool_context_s *ctx, unsigned char *buf, int byteC
 
 		pid->lastCC = cc;
 
-		if (isTEI(buf + i))
+		if (ltntstools_tei_set(buf + i))
 			pid->teiErrors++;
 
 		if (ctx->verbose) {
@@ -220,7 +220,7 @@ static void *thread_func(void *p)
 
 		int pidcnt = 0;
 		for (int i = 0; i < MAX_PID; i++) {
-			struct pid_statistics_s *pid = &ctx->stream.pids[i];
+			struct ltntstools_pid_statistics_s *pid = &ctx->stream.pids[i];
 			if (!pid->enabled)
 				continue;
 
@@ -411,7 +411,7 @@ int udp_capture(int argc, char *argv[])
 			break;
 		if (ch == 'r') {
 			for (int i = 0; i < MAX_PID; i++) {
-				struct pid_statistics_s *pid = &ctx->stream.pids[i];
+				struct ltntstools_pid_statistics_s *pid = &ctx->stream.pids[i];
 				if (!pid->enabled)
 					continue;
 				pid->ccErrors = 0;
